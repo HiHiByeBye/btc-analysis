@@ -1,8 +1,9 @@
 from bitcoinlib.transactions import *
 from bitcoinlib.services.bitcoind import BitcoindClient
 import sqlite3
-import schedule
-import time
+
+from constants import tx_table, tx_db, height_table, height_db, config_table, config_db, transacted_table, transacted_db
+import helper
 
 
 def get_block(bdc, height):
@@ -27,24 +28,24 @@ def get_transactions(block, new_transactions, coin_value, height):
     return used_transactions, amount_at_height
 
 
-def process_transactions(conn, used_transactions, new_transactions, heights, deletes):
-    cur = conn.cursor()
-    for tx in used_transactions:
-        if tx in new_transactions:
-            height, amount = new_transactions.pop(tx)
-        else:
-            cur.execute('SELECT height, amount FROM txid_vout_height_amount WHERE txid=? AND vout=?', tx)
-            result = cur.fetchone()
-            if result:
-                height, amount = result
-                deletes.append(tx)
+def process_transactions(used_transactions, new_transactions, heights, deletes):
+    with sqlite3.connect(tx_db) as conn:
+        cur = conn.cursor()
+        for tx in used_transactions:
+            if tx in new_transactions:
+                height, amount = new_transactions.pop(tx)
             else:
-                raise Exception(tx, 'not found')
-        if height in heights:
-            heights[height] -= amount
-        else:
-            heights[height] = -amount
-    cur.close()
+                cur.execute('SELECT height, amount FROM %s WHERE txid=? AND vout=?' % tx_table, tx)
+                result = cur.fetchone()
+                if result:
+                    height, amount = result
+                    deletes.append(tx)
+                else:
+                    raise Exception(tx, 'not found')
+            if height in heights:
+                heights[height] -= amount
+            else:
+                heights[height] = -amount
 
 
 def get_transaction_inserts(new_transactions):
@@ -56,12 +57,13 @@ def get_transaction_inserts(new_transactions):
     return inserts
 
 
-def adjust_transactions(conn, inserts, deletes):
-    cur = conn.cursor()
-    cur.executemany('DELETE FROM txid_vout_height_amount WHERE txid=? AND vout=?', deletes)
-    cur.executemany('INSERT INTO txid_vout_height_amount VALUES(?,?,?,?)', inserts)
-    cur.close()
-    conn.commit()
+def adjust_transactions(inserts, deletes):
+    with sqlite3.connect(tx_db) as conn:
+        cur = conn.cursor()
+        cur.executemany('DELETE FROM %s WHERE txid=? AND vout=?' % tx_table, deletes)
+        cur.close()
+        conn.commit()
+    helper.insert(tx_db, inserts, tx_table)
 
 
 def get_height_inserts_and_updates(processed_block_height, heights):
@@ -75,48 +77,55 @@ def get_height_inserts_and_updates(processed_block_height, heights):
     return updates, inserts
 
 
-def adjust_heights(conn, updates, inserts):
-    cur = conn.cursor()
-    cur.executemany('UPDATE height_amount SET amount=amount+? WHERE height=?', updates)
-    cur.executemany('INSERT INTO height_amount VALUES(?,?)', inserts)
-    cur.close()
-    conn.commit()
+def adjust_heights(updates, inserts):
+    with sqlite3.connect(height_db) as conn:
+        cur = conn.cursor()
+        cur.executemany('UPDATE %s SET amount=amount+? WHERE height=?' % height_table, updates)
+        cur.executemany('INSERT INTO %s VALUES(?,?)' % height_table, inserts)
+        cur.close()
+        conn.commit()
+
+
+def insert_transacted(block_num, total_transacted):
+    inserts = []
+    for i in range(len(total_transacted)):
+        inserts.append((block_num, total_transacted[i]))
+        block_num += 1
+    helper.insert(transacted_db, inserts, transacted_table)
 
 
 def process_blocks():
     with sqlite3.connect(config_db) as conn:
         cur = conn.cursor()
-        cur.execute('SELECT * FROM config')
+        cur.execute('SELECT * FROM %s' % config_table)
         base_url, processed_block_height = cur.fetchone()
 
     bdc = BitcoindClient(base_url=base_url)
     new_transactions = {}
     deletes = []
     heights = {}
+    total_transacted = []
     coin_value = 100000000
-    with sqlite3.connect(tx_db) as tx_conn:
-        with sqlite3.connect(height_db) as height_conn:
-            block_height = bdc.blockcount() - 6    # 6 blocks deep for security
-            for i in range(processed_block_height+1, block_height+1):
-                block = get_block(bdc, i)
-                used_transactions, amount_at_height = get_transactions(block, new_transactions, coin_value, i)
-                heights[i] = amount_at_height
-                process_transactions(tx_conn, used_transactions, new_transactions, heights, deletes)
+    block_height = bdc.blockcount() - 6    # 6 blocks deep for security
+    for i in range(processed_block_height+1, block_height+1):
+        block = get_block(bdc, i)
+        used_transactions, amount_at_height = get_transactions(block, new_transactions, coin_value, i)
+        heights[i] = amount_at_height
+        total_transacted.append(amount_at_height)
+        process_transactions(used_transactions, new_transactions, heights, deletes)
 
-            transaction_inserts = get_transaction_inserts(new_transactions)
-            adjust_transactions(tx_conn, transaction_inserts, deletes)
+    transaction_inserts = get_transaction_inserts(new_transactions)
+    adjust_transactions(transaction_inserts, deletes)
 
-            updates, inserts = get_height_inserts_and_updates(processed_block_height, heights)
-            adjust_heights(height_conn, updates, inserts)
+    updates, inserts = get_height_inserts_and_updates(processed_block_height, heights)
+    adjust_heights(updates, inserts)
+
+    insert_transacted(processed_block_height+1, total_transacted)
 
     with sqlite3.connect(config_db) as conn:
         cur = conn.cursor()
-        cur.execute('UPDATE config SET block_height=?', (block_height,))
+        cur.execute('UPDATE %s SET block_height=?' % config_table, (block_height,))
         conn.commit()
 
-
-config_db = 'config.db'
-tx_db = 'txid_vout_height_amount.db'
-height_db = 'height_amount.db'
 
 process_blocks()

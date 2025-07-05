@@ -10,7 +10,11 @@ def create_db(db_name, table_creation, index_creation):
         conn.commit()
 
 
-def insert(db_name, inserts, num_columns, table_name):
+def insert(db_name, inserts, table_name):
+    if inserts:
+        num_columns = len(inserts[0])
+    else:
+        return
     with sqlite3.connect(db_name) as conn:
         cur = conn.cursor()
         try:
